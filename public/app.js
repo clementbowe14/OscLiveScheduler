@@ -1,6 +1,12 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   OSC Live Scheduler — Frontend Application Logic (Static / Netlify)
-   Connects directly to Podium System via Socket.IO from the browser.
+   OSC Live Scheduler — Frontend Application Logic
+   
+   Dual-mode fetching:
+     1. Tries the local API first (/api/schedule) — fast, no CORS issues
+     2. Falls back to direct Socket.IO to Podium if no backend is available
+   
+   Retry logic: if any attempt exceeds 500ms, it disconnects and retries
+   up to MAX_RETRIES times.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 (function () {
@@ -10,8 +16,9 @@
   const PODIUM_URL = 'https://live.podiumsystem.mx';
   const EVENT_ID = 215;
   const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+  const SOCKET_TIMEOUT_MS = 500;           // 500ms before retry
+  const MAX_RETRIES = 5;
 
-  // Keywords to match Academia Salsa Ninja Dance Academy entries
   const MATCH_KEYWORDS = [
     'salsa ninja',
     'ninja dance',
@@ -38,6 +45,8 @@
   let nextRefreshTime = null;
   let pollTimer = null;
   let isFetching = false;
+  let lastFetchDate = null;
+  let useLocalApi = null; // null = unknown, true/false = detected
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
   function formatTime(hora) {
@@ -87,10 +96,23 @@
     } else if (status === 'error') {
       statusText.textContent = 'OFFLINE';
       pulseDot.classList.add('error');
+    } else if (status === 'retrying') {
+      statusText.textContent = 'RETRYING';
+      pulseDot.classList.add('loading');
     } else {
       statusText.textContent = 'CONNECTING';
       pulseDot.classList.add('loading');
     }
+  }
+
+  function log(msg, ...args) {
+    const ts = new Date().toLocaleTimeString();
+    console.log(`[OSC ${ts}] ${msg}`, ...args);
+  }
+
+  function logWarn(msg, ...args) {
+    const ts = new Date().toLocaleTimeString();
+    console.warn(`[OSC ${ts}] ${msg}`, ...args);
   }
 
   // ─── Countdown Timer ────────────────────────────────────────────────────
@@ -109,110 +131,177 @@
   }
 
   // Keep last-update chip fresh
-  let lastFetchDate = null;
   setInterval(() => {
     if (lastFetchDate) {
       lastUpdateText.textContent = timeAgo(lastFetchDate);
     }
   }, 5000);
 
-  // ─── Socket.IO Scraper ──────────────────────────────────────────────────
-  function fetchFromPodium() {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MODE 1: Local API fetch (when Node.js backend is running)
+  // ═══════════════════════════════════════════════════════════════════════════
+  async function fetchFromLocalApi() {
+    log('Trying local API at /api/schedule …');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+
+    try {
+      const res = await fetch('/api/schedule', { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      if (!data.lastFetchTime) throw new Error('No data from backend yet');
+
+      lastFetchDate = new Date();
+      renderSchedule(data);
+      setConnectionStatus('live');
+      log(`✓ Local API: ${data.totalEventEntries} total, ${data.filteredCount} Salsa Ninja matches`);
+      return true;
+    } catch (err) {
+      clearTimeout(timer);
+      log(`✗ Local API unavailable: ${err.message}`);
+      return false;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MODE 2: Direct Socket.IO to Podium (for static/Netlify deployment)
+  //         With 500ms timeout + retry logic
+  // ═══════════════════════════════════════════════════════════════════════════
+  function fetchFromPodiumSocket(attempt = 1) {
+    return new Promise((resolve) => {
+      log(`Socket.IO attempt ${attempt}/${MAX_RETRIES} (${SOCKET_TIMEOUT_MS}ms timeout)…`);
+      setConnectionStatus(attempt > 1 ? 'retrying' : 'connecting');
+
+      const userId = 'osc_' + Math.random().toString(36).substr(2, 6) + '_' + Date.now();
+      let settled = false;
+
+      const socket = io(PODIUM_URL, {
+        extraHeaders: { 'x-user': userId },
+        query: { parametro: EVENT_ID },
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: SOCKET_TIMEOUT_MS,
+      });
+
+      // ── 500ms timeout: if no response, kill and retry ──
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        logWarn(`⏱ Attempt ${attempt} timed out after ${SOCKET_TIMEOUT_MS}ms`);
+        socket.disconnect();
+
+        if (attempt < MAX_RETRIES) {
+          resolve(fetchFromPodiumSocket(attempt + 1));
+        } else {
+          logWarn(`✗ All ${MAX_RETRIES} attempts exhausted`);
+          setConnectionStatus('error');
+          resolve(false);
+        }
+      }, SOCKET_TIMEOUT_MS);
+
+      socket.on('connect', () => {
+        log(`  Connected on attempt ${attempt}, emitting load-data-categorias…`);
+        socket.emit('load-data-categorias', { ev: EVENT_ID });
+      });
+
+      socket.on('load-data-categorias-res', (payload) => {
+        if (settled) { socket.disconnect(); return; }
+        clearTimeout(timeoutId);
+        settled = true;
+
+        try {
+          const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
+          const categorias = data.data?.categorias || data.categorias || [];
+          const eventItems = categorias.filter(item => item.eventoId == EVENT_ID);
+          const evName = eventItems.length > 0 ? eventItems[0].evento : '';
+
+          const ninjaItems = eventItems.filter(item => {
+            const searchStr = [
+              item.origen || '',
+              item.estado || '',
+              item.coreografia || '',
+            ].join(' ').toLowerCase();
+            return MATCH_KEYWORDS.some(kw => searchStr.includes(kw));
+          });
+
+          const entries = ninjaItems.map(item => ({
+            turno: item.turno || null,
+            categoria: item.categoria || '',
+            coreografia: item.coreografia || '',
+            origen: item.origen || '',
+            academia: item.estado || '',
+            hora: item.hora || null,
+            fecha: item.fecha || '',
+            estatus: item.estatusCoreografia || '',
+            integrantes: item.integrantes || 0,
+          }));
+
+          lastFetchDate = new Date();
+          renderSchedule({
+            eventName: evName,
+            totalEventEntries: eventItems.length,
+            filteredCount: entries.length,
+            entries: entries,
+          });
+
+          setConnectionStatus('live');
+          log(`✓ Socket attempt ${attempt}: ${eventItems.length} total, ${entries.length} Salsa Ninja matches`);
+          resolve(true);
+        } catch (err) {
+          logWarn(`✗ Parse error on attempt ${attempt}:`, err);
+          setConnectionStatus('error');
+          resolve(false);
+        } finally {
+          socket.disconnect();
+        }
+      });
+
+      socket.on('connect_error', (err) => {
+        if (settled) return;
+        clearTimeout(timeoutId);
+        settled = true;
+        logWarn(`✗ Connection error on attempt ${attempt}: ${err.message}`);
+        socket.disconnect();
+
+        if (attempt < MAX_RETRIES) {
+          resolve(fetchFromPodiumSocket(attempt + 1));
+        } else {
+          setConnectionStatus('error');
+          resolve(false);
+        }
+      });
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Main fetch orchestrator: tries local API first, falls back to Socket.IO
+  // ═══════════════════════════════════════════════════════════════════════════
+  async function fetchData() {
     if (isFetching) return;
     isFetching = true;
-
-    setConnectionStatus('connecting');
     refreshBtn.classList.add('loading');
+    setConnectionStatus('connecting');
 
-    const userId = 'osc_tracker_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
-
-    const socket = io(PODIUM_URL, {
-      extraHeaders: { 'x-user': userId },
-      query: { parametro: EVENT_ID },
-      transports: ['websocket'],
-      reconnection: false,
-      timeout: 20000,
-    });
-
-    const timeout = setTimeout(() => {
-      console.warn('[OSC] Socket timed out after 25s');
-      socket.disconnect();
-      setConnectionStatus('error');
-      isFetching = false;
-      refreshBtn.classList.remove('loading');
-    }, 25000);
-
-    socket.on('connect', () => {
-      console.log('[OSC] Connected to Podium System');
-      socket.emit('load-data-categorias', { ev: EVENT_ID });
-    });
-
-    socket.on('load-data-categorias-res', (payload) => {
-      clearTimeout(timeout);
-      try {
-        const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
-        const categorias = data.data?.categorias || data.categorias || [];
-
-        // Filter for this event
-        const eventItems = categorias.filter(item => item.eventoId == EVENT_ID);
-
-        // Extract event name
-        const evName = eventItems.length > 0 ? eventItems[0].evento : '';
-
-        // Filter for Salsa Ninja
-        const ninjaItems = eventItems.filter(item => {
-          const searchStr = [
-            item.origen || '',
-            item.estado || '',
-            item.coreografia || '',
-          ].join(' ').toLowerCase();
-          return MATCH_KEYWORDS.some(kw => searchStr.includes(kw));
-        });
-
-        const entries = ninjaItems.map(item => ({
-          turno: item.turno || null,
-          categoria: item.categoria || '',
-          coreografia: item.coreografia || '',
-          origen: item.origen || '',
-          academia: item.estado || '',
-          hora: item.hora || null,
-          fecha: item.fecha || '',
-          estatus: item.estatusCoreografia || '',
-          integrantes: item.integrantes || 0,
-        }));
-
-        lastFetchDate = new Date();
-        renderSchedule({
-          eventName: evName,
-          totalEventEntries: eventItems.length,
-          filteredCount: entries.length,
-          entries: entries,
-        });
-
-        setConnectionStatus('live');
-        console.log(`[OSC] Fetched ${eventItems.length} total, ${entries.length} Salsa Ninja matches`);
-      } catch (err) {
-        console.error('[OSC] Parse error:', err);
-        setConnectionStatus('error');
-      } finally {
-        socket.disconnect();
-        isFetching = false;
-        refreshBtn.classList.remove('loading');
+    try {
+      // If we haven't detected the mode yet, or local API was available before
+      if (useLocalApi === null || useLocalApi === true) {
+        const ok = await fetchFromLocalApi();
+        if (ok) {
+          useLocalApi = true;
+          return;
+        }
+        // Local API not available — remember for next time, try socket
+        useLocalApi = false;
       }
-    });
 
-    socket.on('connect_error', (err) => {
-      clearTimeout(timeout);
-      console.error('[OSC] Connection error:', err.message);
-      setConnectionStatus('error');
+      // Fall back to direct Socket.IO with retry logic
+      await fetchFromPodiumSocket(1);
+    } finally {
       isFetching = false;
       refreshBtn.classList.remove('loading');
-    });
-
-    socket.on('disconnect', () => {
-      isFetching = false;
-      refreshBtn.classList.remove('loading');
-    });
+    }
   }
 
   // ─── Render Table ────────────────────────────────────────────────────────
@@ -276,17 +365,19 @@
 
   // ─── Event Listeners ────────────────────────────────────────────────────
   refreshBtn.addEventListener('click', () => {
-    fetchFromPodium();
+    useLocalApi = null; // re-detect on manual refresh
+    fetchData();
     startCountdown();
   });
 
   // ─── Init ────────────────────────────────────────────────────────────────
-  fetchFromPodium();
+  log('Starting OSC Live Scheduler…');
+  fetchData();
   startCountdown();
 
   // Poll every 5 minutes
   pollTimer = setInterval(() => {
-    fetchFromPodium();
+    fetchData();
     startCountdown();
   }, POLL_INTERVAL_MS);
 
