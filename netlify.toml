@@ -1,6 +1,15 @@
 [build]
   publish = "public"
 
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/api/schedule"
+  to = "/.netlify/functions/schedule"
+  status = 200
+
 [[headers]]
   for = "/*"
   [headers.values]

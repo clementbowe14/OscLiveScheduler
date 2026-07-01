@@ -3,7 +3,7 @@ const path = require('path');
 const { io: ioClient } = require('socket.io-client');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let latestScheduleData = [];
@@ -11,10 +11,12 @@ let allCategoriesData = [];
 let lastFetchTime = null;
 let connectionStatus = 'disconnected';
 let eventName = '';
+let lastError = null;
 
-const PODIUM_URL = 'https://live.podiumsystem.mx';
-const EVENT_ID = 215;
+const PODIUM_URL = process.env.PODIUM_URL || 'https://live.podiumsystem.mx';
+const EVENT_ID = Number(process.env.PODIUM_EVENT_ID || 215);
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const PODIUM_READ_TIMEOUT_MS = Number(process.env.PODIUM_READ_TIMEOUT_MS || 55000);
 
 // Keywords to match for "Academia Salsa Ninja Dance Academy" / "Origen"
 const MATCH_KEYWORDS = [
@@ -24,29 +26,85 @@ const MATCH_KEYWORDS = [
 ];
 
 // ─── Scraper ─────────────────────────────────────────────────────────────────
+function podiumLog(message, details) {
+  const prefix = `[${new Date().toLocaleTimeString()}] [Podium] ${message}`;
+  if (details === undefined) {
+    console.log(prefix);
+  } else {
+    console.log(prefix, details);
+  }
+}
+
+function podiumError(message, details) {
+  const prefix = `[${new Date().toLocaleTimeString()}] [Podium] ${message}`;
+  if (details === undefined) {
+    console.error(prefix);
+  } else {
+    console.error(prefix, details);
+  }
+}
+
+function summarizeItem(item) {
+  if (!item) return null;
+  return {
+    eventoId: item.eventoId,
+    evento: item.evento,
+    turno: item.turno,
+    categoria: item.categoria,
+    coreografia: item.coreografia,
+    origen: item.origen,
+    estado: item.estado,
+    hora: item.hora,
+    fecha: item.fecha,
+    estatusCoreografia: item.estatusCoreografia,
+  };
+}
+
 function fetchScheduleData() {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      socket.disconnect();
-      reject(new Error('Socket connection timed out after 30s'));
-    }, 30000);
-
+    const startedAt = Date.now();
+    let settled = false;
     const userId = 'scraper_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+
+    podiumLog('Connecting', {
+      url: PODIUM_URL,
+      eventId: EVENT_ID,
+      timeoutMs: PODIUM_READ_TIMEOUT_MS,
+      hasXUserHeader: true,
+      transport: 'websocket',
+    });
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      socket.disconnect();
+      const err = new Error(`Socket read timed out after ${PODIUM_READ_TIMEOUT_MS}ms`);
+      lastError = err.message;
+      connectionStatus = 'error';
+      podiumError(err.message, { elapsedMs: Date.now() - startedAt });
+      reject(err);
+    }, PODIUM_READ_TIMEOUT_MS);
 
     const socket = ioClient(PODIUM_URL, {
       extraHeaders: { 'x-user': userId },
       query: { parametro: EVENT_ID },
       transports: ['websocket'],
       reconnection: false,
+      timeout: PODIUM_READ_TIMEOUT_MS,
     });
 
     socket.on('connect', () => {
-      console.log(`[${new Date().toLocaleTimeString()}] ✓ Connected to Podium System`);
+      podiumLog('Connected; requesting categories', {
+        elapsedMs: Date.now() - startedAt,
+        socketId: socket.id,
+      });
       connectionStatus = 'connected';
       socket.emit('load-data-categorias', { ev: EVENT_ID });
     });
 
     socket.on('load-data-categorias-res', (payload) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
       try {
         const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
@@ -88,11 +146,27 @@ function fetchScheduleData() {
         }));
 
         lastFetchTime = new Date().toISOString();
-        console.log(`[${new Date().toLocaleTimeString()}] ✓ Fetched ${eventItems.length} total entries, ${filtered.length} Salsa Ninja matches`);
+        lastError = null;
+        podiumLog('Payload parsed', {
+          payloadType: typeof payload,
+          topLevelKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 12) : [],
+          totalCategorias: categorias.length,
+          totalEventEntries: eventItems.length,
+          filteredCount: filtered.length,
+          eventName,
+          firstEventItem: summarizeItem(eventItems[0]),
+          firstMatchedItem: summarizeItem(filtered[0]),
+          elapsedMs: Date.now() - startedAt,
+        });
         connectionStatus = 'success';
         resolve(latestScheduleData);
       } catch (err) {
-        console.error(`[${new Date().toLocaleTimeString()}] ✗ Parse error:`, err.message);
+        lastError = err.message;
+        podiumError('Parse error', {
+          message: err.message,
+          payloadPreview: typeof payload === 'string' ? payload.slice(0, 300) : payload,
+          elapsedMs: Date.now() - startedAt,
+        });
         connectionStatus = 'error';
         reject(err);
       } finally {
@@ -101,11 +175,27 @@ function fetchScheduleData() {
     });
 
     socket.on('connect_error', (err) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
-      console.error(`[${new Date().toLocaleTimeString()}] ✗ Connection error:`, err.message);
+      lastError = err.message;
+      podiumError('Connection error', {
+        message: err.message,
+        description: err.description || null,
+        context: err.context || null,
+        elapsedMs: Date.now() - startedAt,
+      });
       connectionStatus = 'error';
       socket.disconnect();
       reject(err);
+    });
+
+    socket.on('disconnect', (reason) => {
+      podiumLog('Socket disconnected', {
+        reason,
+        settled,
+        elapsedMs: Date.now() - startedAt,
+      });
     });
   });
 }
@@ -115,7 +205,7 @@ async function pollSchedule() {
   try {
     await fetchScheduleData();
   } catch (err) {
-    console.error(`[${new Date().toLocaleTimeString()}] ✗ Fetch failed:`, err.message);
+    podiumError('Fetch failed', { message: err.message });
   }
 }
 
@@ -136,6 +226,8 @@ app.get('/api/schedule', (req, res) => {
     matchKeywords: MATCH_KEYWORDS,
     totalEventEntries: allCategoriesData.length,
     filteredCount: latestScheduleData.length,
+    lastError,
+    source: 'local-server',
     entries: latestScheduleData,
   });
 });
@@ -146,6 +238,7 @@ app.get('/api/schedule/all', (req, res) => {
     eventName,
     lastFetchTime,
     connectionStatus,
+    lastError,
     totalEntries: allCategoriesData.length,
     entries: allCategoriesData.map(item => ({
       turno: item.turno,

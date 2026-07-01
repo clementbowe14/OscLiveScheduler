@@ -5,8 +5,9 @@
      1. Tries the local API first (/api/schedule) — fast, no CORS issues
      2. Falls back to direct Socket.IO to Podium if no backend is available
    
-   Retry logic: if any attempt exceeds 500ms, it disconnects and retries
-   up to MAX_RETRIES times.
+   In production, /api/schedule is expected to be served by the Netlify
+   Function because browsers cannot send the x-user WebSocket header Podium
+   expects.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 (function () {
@@ -16,8 +17,10 @@
   const PODIUM_URL = 'https://live.podiumsystem.mx';
   const EVENT_ID = 215;
   const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-  const SOCKET_TIMEOUT_MS = 500;           // 500ms before retry
-  const MAX_RETRIES = 5;
+  const API_TIMEOUT_MS = 20000;
+  const API_SLOW_WARNING_MS = 8000;
+  const SOCKET_TIMEOUT_MS = 30000;
+  const MAX_RETRIES = 2;
 
   const MATCH_KEYWORDS = [
     'salsa ninja',
@@ -37,6 +40,10 @@
   const pollInterval = document.getElementById('pollInterval');
   const loadingState = document.getElementById('loadingState');
   const emptyState = document.getElementById('emptyState');
+  const emptyStateIcon = emptyState.querySelector('.empty-icon');
+  const emptyStateTitle = emptyState.querySelector('h3');
+  const emptyStateMessage = emptyState.querySelector('p');
+  const loadingStateMessage = loadingState.querySelector('p');
   const scheduleTable = document.getElementById('scheduleTable');
   const scheduleBody = document.getElementById('scheduleBody');
 
@@ -105,14 +112,103 @@
     }
   }
 
+  function isLocalHost() {
+    return ['localhost', '127.0.0.1', ''].includes(window.location.hostname);
+  }
+
+  function shouldAttemptBrowserSocketFallback() {
+    return isLocalHost() || window.location.protocol === 'file:';
+  }
+
+  function serializeLogArg(arg) {
+    if (arg instanceof Error) {
+      return { name: arg.name, message: arg.message, stack: arg.stack };
+    }
+
+    if (arg && typeof arg === 'object') {
+      try {
+        return JSON.parse(JSON.stringify(arg));
+      } catch (jsonErr) {
+        return String(arg);
+      }
+    }
+
+    return arg;
+  }
+
+  function recordLog(level, msg, args) {
+    const entry = {
+      at: new Date().toISOString(),
+      level,
+      message: msg,
+      details: args.map(serializeLogArg),
+    };
+
+    window.OSC_LOGS = window.OSC_LOGS || [];
+    window.OSC_LOGS.push(entry);
+    if (window.OSC_LOGS.length > 100) window.OSC_LOGS.shift();
+    window.oscDiagnostics = () => ({
+      mode: useLocalApi === null ? 'detecting' : useLocalApi ? 'api' : 'socket-fallback',
+      lastFetchDate: lastFetchDate ? lastFetchDate.toISOString() : null,
+      currentUrl: window.location.href,
+      logs: window.OSC_LOGS,
+    });
+  }
+
   function log(msg, ...args) {
     const ts = new Date().toLocaleTimeString();
+    recordLog('info', msg, args);
     console.log(`[OSC ${ts}] ${msg}`, ...args);
   }
 
   function logWarn(msg, ...args) {
     const ts = new Date().toLocaleTimeString();
+    recordLog('warn', msg, args);
     console.warn(`[OSC ${ts}] ${msg}`, ...args);
+  }
+
+  function summarizeApiData(data) {
+    return {
+      eventName: data.eventName || null,
+      lastFetchTime: data.lastFetchTime || null,
+      connectionStatus: data.connectionStatus || null,
+      totalEventEntries: data.totalEventEntries ?? null,
+      filteredCount: data.filteredCount ?? null,
+      lastError: data.lastError || null,
+      source: data.source || null,
+    };
+  }
+
+  function showLoadingState(message = 'Connecting to Podium System...') {
+    loadingStateMessage.textContent = message;
+    loadingState.style.display = 'flex';
+    emptyState.style.display = 'none';
+    scheduleTable.style.display = 'none';
+  }
+
+  function showMessageState({ icon, title, message }) {
+    emptyStateIcon.textContent = icon;
+    emptyStateTitle.textContent = title;
+    emptyStateMessage.textContent = message;
+    loadingState.style.display = 'none';
+    emptyState.style.display = 'flex';
+    scheduleTable.style.display = 'none';
+  }
+
+  function showNoPerformancesState() {
+    showMessageState({
+      icon: '🔍',
+      title: 'No Performances Found',
+      message: 'No choreographies from Academia Salsa Ninja Dance Academy are currently listed. The schedule updates every 5 minutes — check back soon!',
+    });
+  }
+
+  function showReadErrorState(reason) {
+    showMessageState({
+      icon: '!',
+      title: 'Live Schedule Unavailable',
+      message: `${reason} Open the browser console and run window.oscDiagnostics() for details.`,
+    });
   }
 
   // ─── Countdown Timer ────────────────────────────────────────────────────
@@ -141,33 +237,65 @@
   // MODE 1: Local API fetch (when Node.js backend is running)
   // ═══════════════════════════════════════════════════════════════════════════
   async function fetchFromLocalApi() {
-    log('Trying local API at /api/schedule …');
+    log(`Trying local API at /api/schedule (${API_TIMEOUT_MS}ms timeout)...`);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
+    const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    const slowTimer = setTimeout(() => {
+      showLoadingState('Still waiting for the Podium read...');
+      logWarn(`Local API is still pending after ${API_SLOW_WARNING_MS}ms`, {
+        apiPath: '/api/schedule',
+        timeoutMs: API_TIMEOUT_MS,
+      });
+    }, API_SLOW_WARNING_MS);
 
     try {
       const res = await fetch('/api/schedule', { signal: controller.signal });
       clearTimeout(timer);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      clearTimeout(slowTimer);
+      const responseText = await res.text();
+      let data = null;
+
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch (jsonErr) {
+        throw new Error(`HTTP ${res.status}; response was not JSON: ${responseText.slice(0, 160)}`);
+      }
+
+      if (!res.ok) {
+        const message = data.error || data.message || `HTTP ${res.status}`;
+        logWarn('Local API returned an error payload:', {
+          status: res.status,
+          statusText: res.statusText,
+          summary: summarizeApiData(data),
+        });
+        throw new Error(message);
+      }
 
       if (!data.lastFetchTime) throw new Error('No data from backend yet');
 
       lastFetchDate = new Date();
       renderSchedule(data);
       setConnectionStatus('live');
-      log(`✓ Local API: ${data.totalEventEntries} total, ${data.filteredCount} Salsa Ninja matches`);
+      log(`Local API read succeeded: ${data.totalEventEntries} total, ${data.filteredCount} Salsa Ninja matches`, summarizeApiData(data));
       return true;
     } catch (err) {
       clearTimeout(timer);
-      log(`✗ Local API unavailable: ${err.message}`);
+      clearTimeout(slowTimer);
+      const reason = err.name === 'AbortError'
+        ? `timed out after ${API_TIMEOUT_MS}ms`
+        : err.message;
+      logWarn(`Local API unavailable: ${reason}`, {
+        apiPath: '/api/schedule',
+        canUseBrowserSocketFallback: shouldAttemptBrowserSocketFallback(),
+      });
       return false;
     }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MODE 2: Direct Socket.IO to Podium (for static/Netlify deployment)
-  //         With 500ms timeout + retry logic
+  // MODE 2: Direct Socket.IO to Podium fallback.
+  // In production this normally requires the Netlify Function proxy because
+  // browsers cannot send the x-user WebSocket header Podium expects.
   // ═══════════════════════════════════════════════════════════════════════════
   function fetchFromPodiumSocket(attempt = 1) {
     return new Promise((resolve) => {
@@ -185,11 +313,13 @@
         timeout: SOCKET_TIMEOUT_MS,
       });
 
-      // ── 500ms timeout: if no response, kill and retry ──
       const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
-        logWarn(`⏱ Attempt ${attempt} timed out after ${SOCKET_TIMEOUT_MS}ms`);
+        logWarn(
+          `Socket attempt ${attempt} timed out after ${SOCKET_TIMEOUT_MS}ms. ` +
+          'If this is production, verify /api/schedule is routed to the Netlify Function; browsers cannot send the x-user header Podium expects.'
+        );
         socket.disconnect();
 
         if (attempt < MAX_RETRIES) {
@@ -197,6 +327,7 @@
         } else {
           logWarn(`✗ All ${MAX_RETRIES} attempts exhausted`);
           setConnectionStatus('error');
+          showReadErrorState('Direct Podium socket attempts timed out.');
           resolve(false);
         }
       }, SOCKET_TIMEOUT_MS);
@@ -247,11 +378,12 @@
           });
 
           setConnectionStatus('live');
-          log(`✓ Socket attempt ${attempt}: ${eventItems.length} total, ${entries.length} Salsa Ninja matches`);
+          log(`Socket attempt ${attempt} read succeeded: ${eventItems.length} total, ${entries.length} Salsa Ninja matches`);
           resolve(true);
         } catch (err) {
-          logWarn(`✗ Parse error on attempt ${attempt}:`, err);
+          logWarn(`Parse error on socket attempt ${attempt}:`, err);
           setConnectionStatus('error');
+          showReadErrorState('Podium returned data the app could not parse.');
           resolve(false);
         } finally {
           socket.disconnect();
@@ -262,13 +394,18 @@
         if (settled) return;
         clearTimeout(timeoutId);
         settled = true;
-        logWarn(`✗ Connection error on attempt ${attempt}: ${err.message}`);
+        logWarn(`Connection error on socket attempt ${attempt}: ${err.message}`, {
+          description: err.description || null,
+          context: err.context || null,
+          productionHint: 'Static browsers cannot send the x-user WebSocket header; use /api/schedule via Netlify Function.',
+        });
         socket.disconnect();
 
         if (attempt < MAX_RETRIES) {
           resolve(fetchFromPodiumSocket(attempt + 1));
         } else {
           setConnectionStatus('error');
+          showReadErrorState(`Direct Podium socket failed: ${err.message}`);
           resolve(false);
         }
       });
@@ -282,6 +419,7 @@
     if (isFetching) return;
     isFetching = true;
     refreshBtn.classList.add('loading');
+    showLoadingState();
     setConnectionStatus('connecting');
 
     try {
@@ -296,7 +434,21 @@
         useLocalApi = false;
       }
 
-      // Fall back to direct Socket.IO with retry logic
+      if (!shouldAttemptBrowserSocketFallback()) {
+        logWarn(
+          'Production API read failed and direct browser Socket.IO fallback was skipped. ' +
+          'Expected fix: /api/schedule must route to the Netlify Function so the request can include Podium x-user headers.',
+          {
+            host: window.location.host,
+            protocol: window.location.protocol,
+            diagnostics: 'Run window.oscDiagnostics() in the browser console for the last 100 app log entries.',
+          }
+        );
+        setConnectionStatus('error');
+        showReadErrorState('The production API route did not return a usable schedule.');
+        return;
+      }
+
       await fetchFromPodiumSocket(1);
     } finally {
       isFetching = false;
@@ -316,8 +468,7 @@
     loadingState.style.display = 'none';
 
     if (entries.length === 0) {
-      emptyState.style.display = 'flex';
-      scheduleTable.style.display = 'none';
+      showNoPerformancesState();
       return;
     }
 
