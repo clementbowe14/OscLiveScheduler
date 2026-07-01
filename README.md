@@ -36,6 +36,18 @@ npm start
 # → http://localhost:3000
 ```
 
+## 🔎 Production Diagnostics
+
+Production reads should go through `/api/schedule`, which Netlify routes to `netlify/functions/schedule.js`. That server-side function can send the `x-user` WebSocket header required by Podium.
+
+To debug a production browser session, open DevTools and run:
+
+```js
+window.oscDiagnostics()
+```
+
+Netlify Function logs are prefixed with `[podium:<request-id>]` and show the read stage: connection, payload parsing, match counts, stale-cache fallback, or failure details.
+
 ## 📁 Project Structure
 
 ```
