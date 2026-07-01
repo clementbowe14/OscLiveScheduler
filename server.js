@@ -24,6 +24,52 @@ const MATCH_KEYWORDS = [
 ];
 
 // ─── Scraper ─────────────────────────────────────────────────────────────────
+function parseScheduleTime(hora) {
+  const match = String(hora || '').match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return Number.POSITIVE_INFINITY;
+  const hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
+  const seconds = parseInt(match[3] || '0', 10);
+  return (hours * 60 * 60) + (minutes * 60) + seconds;
+}
+
+function parseScheduleDate(fecha) {
+  if (!fecha) return Number.POSITIVE_INFINITY;
+
+  const normalized = String(fecha).trim();
+  const isoMatch = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (isoMatch) {
+    return Date.UTC(
+      parseInt(isoMatch[1], 10),
+      parseInt(isoMatch[2], 10) - 1,
+      parseInt(isoMatch[3], 10)
+    );
+  }
+
+  const slashMatch = normalized.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    const first = parseInt(slashMatch[1], 10);
+    const second = parseInt(slashMatch[2], 10);
+    const year = parseInt(slashMatch[3], 10);
+    const month = first > 12 ? second : first;
+    const day = first > 12 ? first : second;
+    return Date.UTC(year, month - 1, day);
+  }
+
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+}
+
+function compareScheduleEntries(a, b) {
+  const dateDiff = parseScheduleDate(a.fecha) - parseScheduleDate(b.fecha);
+  if (dateDiff !== 0) return dateDiff;
+
+  const timeDiff = parseScheduleTime(a.hora) - parseScheduleTime(b.hora);
+  if (timeDiff !== 0) return timeDiff;
+
+  return (a.turno || Number.POSITIVE_INFINITY) - (b.turno || Number.POSITIVE_INFINITY);
+}
+
 function fetchScheduleData() {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -85,7 +131,7 @@ function fetchScheduleData() {
           integrantes: item.integrantes || 0,
           competenciaId: item.competenciaId || '',
           noSeguimiento: item.noSeguimiento || 0,
-        }));
+        })).sort(compareScheduleEntries);
 
         lastFetchTime = new Date().toISOString();
         console.log(`[${new Date().toLocaleTimeString()}] ✓ Fetched ${eventItems.length} total entries, ${filtered.length} Salsa Ninja matches`);
@@ -157,7 +203,7 @@ app.get('/api/schedule/all', (req, res) => {
       fecha: item.fecha,
       estatus: item.estatusCoreografia,
       integrantes: item.integrantes,
-    })),
+    })).sort(compareScheduleEntries),
   });
 });
 
