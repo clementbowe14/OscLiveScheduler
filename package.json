@@ -1,0 +1,14 @@
+{
+  "name": "osc-live-scheduler",
+  "version": "1.0.0",
+  "description": "Orlando Salsa Congress Live Schedule Tracker for Academia Salsa Ninja Dance Academy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "socket.io-client": "^4.7.5"
+  }
+}

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OSC Live Scheduler — Salsa Ninja Tracker</title>
+  <meta name="description" content="Live schedule tracker for Academia Salsa Ninja Dance Academy at the Orlando Salsa Congress 2026" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Animated background particles -->
+  <div class="bg-particles" aria-hidden="true">
+    <div class="particle p1"></div>
+    <div class="particle p2"></div>
+    <div class="particle p3"></div>
+    <div class="particle p4"></div>
+    <div class="particle p5"></div>
+  </div>
+
+  <div class="app-container">
+
+    <!-- Hero Header -->
+    <header class="hero-header">
+      <div class="hero-badge">
+        <span class="pulse-dot"></span>
+        <span id="statusText">CONNECTING</span>
+      </div>
+      <h1 class="hero-title">
+        <span class="title-accent">🥷</span>
+        <span>Salsa Ninja</span>
+        <span class="title-highlight">Live Tracker</span>
+      </h1>
+      <p class="hero-subtitle">
+        Choreography schedule for <strong>Origen — Academia Salsa Ninja Dance Academy</strong><br />
+        at the <em>Orlando Salsa Congress 2026</em>
+      </p>
+      <div class="hero-meta">
+        <div class="meta-chip" id="eventNameChip">
+          <span class="chip-icon">🎪</span>
+          <span id="eventNameText">Loading event…</span>
+        </div>
+        <div class="meta-chip" id="lastUpdateChip">
+          <span class="chip-icon">🕐</span>
+          <span>Last update: </span>
+          <span id="lastUpdateText">—</span>
+        </div>
+        <div class="meta-chip" id="nextRefreshChip">
+          <span class="chip-icon">⏳</span>
+          <span>Next refresh: </span>
+          <span id="nextRefreshText">—</span>
+        </div>
+      </div>
+      <button id="refreshBtn" class="refresh-btn" title="Force refresh now">
+        <svg class="refresh-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </svg>
+        Refresh Now
+      </button>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+
+      <!-- Stats Bar -->
+      <div class="stats-bar">
+        <div class="stat-card">
+          <span class="stat-value" id="totalEntries">—</span>
+          <span class="stat-label">Total Event Entries</span>
+        </div>
+        <div class="stat-card stat-highlight">
+          <span class="stat-value" id="ninjaEntries">—</span>
+          <span class="stat-label">Salsa Ninja Performances</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value" id="pollInterval">5 min</span>
+          <span class="stat-label">Refresh Interval</span>
+        </div>
+      </div>
+
+      <!-- Schedule Table -->
+      <section class="table-section">
+        <div class="table-header">
+          <h2 class="table-title">
+            <span class="table-icon">💃</span>
+            Choreography Schedule
+          </h2>
+          <a href="https://live.podiumsystem.mx/minuto?ev=215" target="_blank" rel="noopener" class="source-link">
+            View Full Schedule ↗
+          </a>
+        </div>
+
+        <div class="table-wrapper" id="tableWrapper">
+          <div class="loading-state" id="loadingState">
+            <div class="spinner"></div>
+            <p>Connecting to Podium System…</p>
+          </div>
+
+          <div class="empty-state" id="emptyState" style="display:none;">
+            <span class="empty-icon">🔍</span>
+            <h3>No Performances Found</h3>
+            <p>No choreographies from Academia Salsa Ninja Dance Academy are currently listed.<br/>The schedule updates every 5 minutes — check back soon!</p>
+          </div>
+
+          <table class="schedule-table" id="scheduleTable" style="display:none;">
+            <thead>
+              <tr>
+                <th class="th-turn">#</th>
+                <th class="th-time">Time</th>
+                <th class="th-date">Date</th>
+                <th class="th-choreo">Choreography</th>
+                <th class="th-category">Category</th>
+                <th class="th-origin">Origin — Academy</th>
+                <th class="th-members">Members</th>
+                <th class="th-status">Status</th>
+              </tr>
+            </thead>
+            <tbody id="scheduleBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <p>
+        Data source: <a href="https://live.podiumsystem.mx/minuto?ev=215" target="_blank" rel="noopener">Podium System — Orlando Salsa Congress 2026</a>
+      </p>
+      <p class="footer-note">Auto-refreshes every 5 minutes • Schedule may change without notice</p>
+    </footer>
+
+  </div>
+
+  <!-- Socket.IO client from CDN -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
