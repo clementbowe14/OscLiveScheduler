@@ -2,6 +2,8 @@
 
 Live schedule tracker for **Academia Salsa Ninja Dance Academy** performing at the **Orlando Salsa Congress 2026**.
 
+Check it out https://osclivescheduler.netlify.app/
+
 ## 🎯 What It Does
 
 - Connects directly to the [Podium System](https://live.podiumsystem.mx/minuto?ev=215) live schedule via Socket.IO
